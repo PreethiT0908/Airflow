@@ -1,790 +1,414 @@
-# Dynamic DAG Service — airflow_job1 v1
+# Dynamic DAG Service — airflow_job1
 
-> **Version:** 1.0.0 | **Dev:** Airflow 3.0.6 | **Prod:** Airflow 3.1.8
-
-A FastAPI service that dynamically generates Airflow DAG Python files from a JSON payload. You describe your workflow as a list of nodes — the service builds, validates, and writes the DAG file to disk for Airflow to pick up automatically.
+Version 1.3  ·  Airflow 3.0.6 (dev) / 3.1.8 (prod)
 
 ---
 
-## Table of Contents
+## What problem does this solve
 
-1. [Architecture Overview](#1-architecture-overview)
-2. [Two Phases: Build and Run](#2-two-phases-build-and-run)
-3. [Installation and Setup](#3-installation-and-setup)
-4. [Environment Variables](#4-environment-variables)
-5. [Build Phase — API Reference](#5-build-phase--api-reference)
-6. [Node Configuration Reference](#6-node-configuration-reference)
-7. [Execution Modes](#7-execution-modes)
-8. [Parallel Lanes and Layer Structure](#8-parallel-lanes-and-layer-structure)
-9. [Branching](#9-branching)
-10. [Merging](#10-merging)
-11. [Why TaskGroup Was Removed](#11-why-taskgroup-was-removed)
-12. [Run Phase — Triggering the DAG](#12-run-phase--triggering-the-dag)
-13. [Async Node — How Polling Works](#13-async-node--how-polling-works)
-14. [Resume a Failed DAG Run](#14-resume-a-failed-dag-run)
-15. [Idempotency — Build and Runtime](#15-idempotency--build-and-runtime)
-16. [Kafka Events](#16-kafka-events)
-17. [Error Handling Reference](#17-error-handling-reference)
-18. [Registry Files](#18-registry-files)
-19. [DAG Structure — What Gets Generated](#19-dag-structure--what-gets-generated)
-20. [Known Constraints and Rules](#20-known-constraints-and-rules)
+Running the same orchestration framework across dozens of workflows means maintaining dozens of near-identical DAG files. One typo in the wrong place breaks a pipeline and there is no single place to look when something goes wrong.
+
+This service changes that. You describe what you want — a list of services to call, in what order, with what execution behaviour — and it generates the Airflow DAG file. The DAG itself contains no hardcoded endpoints, no credentials, none of that. All the runtime specifics travel separately in the trigger payload when someone actually kicks off a run.
+
+One service to maintain instead of fifty DAG files.
 
 ---
 
-## 1. Architecture Overview
+## How the two sides fit together
+
+There are two separate machines involved and it matters to understand which is which.
 
 ```
-  Your System
+Your orchestrator
       │
-      │  POST /build_dag  (once, at workflow design time)
-      ▼
-┌─────────────────────┐
-│  Dynamic DAG        │   FastAPI + Pydantic validation
-│  Service            │   Generates a .py DAG file
-│  (this service)     │   Writes to AIRFLOW_DAGS_DIR
-└─────────┬───────────┘
-          │ writes dag_<id>_<timestamp>.py
-          ▼
-┌─────────────────────┐
-│  Airflow DAGs       │   Airflow scheduler picks up the file
-│  Folder             │   DAG appears in UI within scan interval
-└─────────┬───────────┘
-          │
-          │  POST /api/v1/dags/<dag_id>/dagRuns  (at execution time)
-          ▼
-┌─────────────────────┐
-│  Airflow            │   Runs the generated DAG
-│  Scheduler + Worker │   Tasks call HTTP endpoints
-└─────────┬───────────┘
-          │
-          ▼
-┌─────────────────────┐
-│  Kafka              │   run.started.v1 / run.succeeded.v1 / run.failed.v1
-└─────────────────────┘
+      ├── POST /build_dag ──────────────────► FastAPI VM
+      │                                        writes <dag_id>.py to DAGs folder
+      │                                        tracks it in build_registry.json
+      │
+      └── POST Airflow trigger API ──────────► Airflow VM
+                                               scheduler picks up the .py file
+                                               workers run the tasks
+                                               each task makes HTTP calls
+                                               Kafka events fire at start and end
 ```
+
+The DAG file travels from the FastAPI VM to the Airflow VM through a git-synced folder or a shared network mount. Both VMs need their own set of packages — they do not share the same Python environment.
 
 ---
 
-## 2. Two Phases: Build and Run
+## The three node fields — read this before anything else
 
-| Phase | Who calls it | When | What it does |
-|-------|-------------|------|-------------|
-| **Build** | Your system → `POST /build_dag` | Once per unique workflow | Validates nodes, generates DAG `.py` file, stores idempotency entry |
-| **Run** | Your system → Airflow REST API | Every time you want to execute | Triggers the generated DAG with a `conf` payload containing per-node HTTP configs |
+Every node in the build payload has three fields that do completely different jobs. Getting this wrong is the most common source of confusion.
 
-These are **fully decoupled**. Build once, run many times. The same build can be triggered hundreds of times with different `conf` payloads.
+**`id`**
+Internal reference only. Never shown in the Airflow UI, never used at runtime. Auto-assigns as `task1`, `task2`, etc. if you leave it out. This is what `on_success_node_ids` and `on_failure_node_ids` reference for branching wiring.
+
+**`name`**
+The label Airflow shows for this task in the graph view — what you see on screen when you open the DAG. Does not need to be globally unique. If the same service name appears in two different stages the service appends `_{order}_{seq}` automatically.
+
+**`executor_build_id`**
+The stable service identifier. This is the key you use in the run-time conf when you trigger a DAG run. Required on every node — no default, no fallback. If a node has `executor_build_id: "EDM_Location_Inbound_NAS_TO_PVC"` then the run conf must have `"EDM_Location_Inbound_NAS_TO_PVC": { "url": "...", "json": {...} }`.
 
 ---
 
-## 3. Installation and Setup
+## System requirements
 
-### Requirements
+### FastAPI VM
 
-```
-python >= 3.11
-airflow >= 3.0.6
-fastapi
-uvicorn
-pydantic >= 2.0
-portalocker
-requests
-apache-airflow-providers-apache-kafka
-apache-airflow-providers-standard
-```
+| Requirement | Minimum |
+|---|---|
+| Python | 3.10 |
+| pip | current |
+| Write access to the DAGs folder | required |
+| Network access to Airflow API | required |
 
-### Install
+### Airflow VM
+
+| Requirement | Version |
+|---|---|
+| Apache Airflow | **3.0.6** |
+| Python | 3.10 |
+| Kafka broker reachable from workers | required |
+| Airflow connection `genesis_kafka_conn` | must exist in Admin → Connections |
+
+---
+
+## Installation
+
+### FastAPI VM
 
 ```bash
-pip install fastapi uvicorn pydantic portalocker requests
-pip install apache-airflow-providers-apache-kafka
-pip install apache-airflow-providers-standard
+git clone <repo-url>
+cd dynamic-dag-service
+
+python3 -m venv venv
+source venv/bin/activate
+
+pip install -r requirements.txt
+
+cp .env.example .env
+# open .env and at minimum set AIRFLOW_DAGS_DIR
 ```
 
-### Run the service
+### Airflow VM
 
 ```bash
-# Dev
+# run inside your Airflow worker container or directly on the worker machine
+pip install -r requirements.txt
+```
+
+Restart the scheduler and workers after installing.
+
+---
+
+## Environment variables
+
+### FastAPI VM
+
+| Variable | Default | What it does |
+|---|---|---|
+| `AIRFLOW_DAGS_DIR` | `./dag_configs` | Where generated DAG `.py` files are written. Point this at the folder your Airflow scheduler watches — a git-synced path or NFS mount. |
+| `BUILD_IDEMPOTENCY_REGISTRY` | `<AIRFLOW_DAGS_DIR>/build_registry.json` | JSON file that tracks which build payloads have already been processed so identical payloads do not overwrite a working DAG file. |
+| `KAFKA_CONN_ID` | `genesis_kafka_conn` | Must match the connection ID you created in Airflow Admin → Connections. |
+| `KAFKA_RUN_TOPIC` | `genesis.hub.run.events.v1` | Topic where run start and end events land. |
+| `LOG_LEVEL` | `INFO` | Set to `DEBUG` during development if you need to trace requests. |
+| `HOST` | `127.0.0.1` | Bind address. Change to `0.0.0.0` if the service needs to accept connections from other machines. |
+| `PORT` | `8443` | Port uvicorn binds to. |
+
+### Airflow VM
+
+| Variable | Default | What it does |
+|---|---|---|
+| `HTTP_RETRY_ATTEMPTS` | `3` | How many times a failing HTTP call is retried before the task gives up. |
+| `HTTP_RETRY_MIN_WAIT_SECONDS` | `2` | Minimum seconds to wait between retries. |
+| `HTTP_RETRY_MAX_WAIT_SECONDS` | `10` | Maximum wait. Actual wait grows exponentially between min and max. |
+
+> `RUNTIME_IDEMPOTENCY_REGISTRY` was removed in v1.2. Do not set it.
+
+---
+
+## Starting the service
+
+```bash
+source venv/bin/activate
 python dynamic_dag_service_v1_airflow306.py
-
-# Or via uvicorn directly
-uvicorn dynamic_dag_service_v1_airflow306:app --host 0.0.0.0 --port 8443
-
-# Production
-python dynamic_dag_service_v1_airflow318.py
 ```
 
-### Health check
+As a systemd service in production:
 
 ```bash
-curl http://localhost:8443/health
-# {"status": "UP", "version": "1.0.0-airflow306"}
+sudo systemctl start dynamic-dag-service
+sudo systemctl enable dynamic-dag-service
+```
+
+Health check:
+
+```bash
+curl http://127.0.0.1:8443/health
+# {"status": "UP", "version": "1.3.0-airflow306"}
 ```
 
 ---
 
-## 4. Environment Variables
+## API endpoints
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `AIRFLOW_DAGS_DIR` | `./dag_configs` | Where generated DAG files are written |
-| `KAFKA_CONN_ID` | `genesis_kafka_conn` | Airflow connection ID for Kafka |
-| `KAFKA_RUN_TOPIC` | `genesis.hub.run.events.v1` | Kafka topic for DAG lifecycle events |
-| `BUILD_IDEMPOTENCY_REGISTRY` | `<DAGS_DIR>/build_registry.json` | Path to build idempotency registry |
-| `RUNTIME_IDEMPOTENCY_REGISTRY` | `/tmp/dynamic_dag_runtime_registry.json` | Path to runtime idempotency registry (inside generated DAG) |
-| `LOG_LEVEL` | `INFO` | Logging level: DEBUG, INFO, WARNING, ERROR |
-| `HOST` | `127.0.0.1` | Service bind host |
-| `PORT` | `8443` | Service bind port |
+### GET /health
 
----
-
-## 5. Build Phase — API Reference
-
-### `POST /build_dag`
-
-**Request body:**
+Quick liveness check. Returns service version.
 
 ```json
-{
-  "run_control_id": "DEMO_10",
-  "triggerType": "O",
-  "schedule": null,
-  "nodes": [ ...node objects... ]
-}
+{"status": "UP", "version": "1.3.0-airflow306"}
 ```
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `run_control_id` | string | ✅ | Unique identifier for this workflow. Becomes the DAG ID prefix. |
-| `triggerType` | string | No | `"O"` (one-off), `"M"` (manual), `"S"` (scheduled). Also accepts `"0"`, `"1"`, `"2"`. |
-| `schedule` | string | No | Cron expression e.g. `"0 9 * * 1-5"`. `null` = no schedule. |
-| `nodes` | array | ✅ | List of node objects (min 1). |
+---
 
-**Response (201):**
+### POST /build_dag
+
+Generates the Airflow DAG file. The only endpoint you call at build time.
+
+See `PAYLOAD_REFERENCE.md` for the complete schema and worked examples.
+
+**Success (HTTP 201):**
 
 ```json
 {
   "status": "SUCCESS",
   "dag_id": "demo_10_dag",
-  "file": "demo_10_dag_20260505_100246.py",
-  "path": "/airflow/dags/demo_10_dag_20260505_100246.py",
-  "idempotency_key": "sha256hex...",
+  "file": "demo_10_dag.py",
+  "path": "/opt/dag_configs/demo_10_dag.py",
+  "idempotency_key": "a3f9c2...",
   "idempotent_reused": false
 }
 ```
 
-If the exact same payload is sent again, `idempotent_reused: true` is returned and no new file is written.
+When you send the same payload twice, `idempotent_reused` comes back `true` and nothing on disk is touched.
 
-**Validation errors return 422** with a `detail` array describing exactly what failed.
+**Error codes:**
 
----
-
-## 6. Node Configuration Reference
-
-Each node in the `nodes` array:
-
-```json
-{
-  "id": "task1",
-  "name": "KK_File_Transfer",
-  "engine": "PYTHON",
-  "executor_order_id": 1,
-  "executor_sequence_id": 1,
-  "execution_mode": "sync",
-  "branch_on_status": false,
-  "on_success_node_ids": [],
-  "on_failure_node_ids": []
-}
-```
-
-| Field | Type | Required | Rules |
-|-------|------|----------|-------|
-| `id` | string | ✅ | Must be unique across all nodes. Used as the key in `conf` at run time. |
-| `name` | string | ✅ | Must be unique across all nodes. Becomes the Airflow task ID exactly as written. |
-| `engine` | string | ✅ | Free text. Currently informational (e.g. `"PYTHON"`, `"JAVA"`). |
-| `executor_order_id` | int ≥ 1 | ✅ | Stage/layer number. Nodes with the same value run in parallel. |
-| `executor_sequence_id` | int ≥ 1 | ✅ | Position within a layer. Must be unique per `executor_order_id`. |
-| `execution_mode` | string | No | `"sync"` (default), `"async_no_wait"`, `"fire_and_forget"` |
-| `branch_on_status` | bool | No | `false` (default). Set `true` to enable success/failure routing. |
-| `on_success_node_ids` | array | No | Node IDs to route to on success. Only valid when `branch_on_status: true`. |
-| `on_failure_node_ids` | array | No | Node IDs to route to on failure. Only valid when `branch_on_status: true`. |
-
-### Critical naming rules
-
-- `name` becomes the **Airflow task ID verbatim**. What you put in `name` is exactly what appears in the Airflow UI.
-- `name` must be **unique across the entire DAG**. Duplicate names cause a 422 error at build time.
-- `id` must also be unique. It is used as the key in `dag_run.conf` at run time.
-- `id` and `name` can be different — `id` is your internal key, `name` is the display label.
+| Code | Cause |
+|---|---|
+| 422 | Payload validation failed. The `detail` array says exactly what is wrong — duplicate node ids, unknown branch targets, cycle detected, missing required fields. |
+| 500 | Unexpected failure — disk permissions, template bug. Check service logs. |
 
 ---
 
-## 7. Execution Modes
+## Execution modes
 
-### `sync` (default)
+Every node declares `execution_mode`. Pick the one that matches how the downstream service behaves.
 
-Makes an HTTP call and waits for the response. Task completes when the HTTP response is received.
+### sync
 
-```
-submit → wait for HTTP response → mark success/failure
-```
+Makes one HTTP call, waits for the response, moves on. If the response is 2xx the task succeeds. Anything else and it fails with a full diagnostic block in the logs.
 
-### `async_no_wait`
+Use this for anything that completes inline in a reasonable time — typically under a few minutes.
 
-Makes an HTTP call to start a job, extracts a `tracking_id` from the response, then **polls a status endpoint** in a loop until the job reaches a terminal state. The Airflow worker slot is held for the entire polling duration.
+### async_no_wait
 
-```
-submit → get tracking_id → poll status every N seconds → terminal state → mark success/failure
-```
+Submits a job, extracts a tracking ID from the response body, then polls a status URL on an interval until the job reaches a terminal state. The task stays running and holds a worker slot the entire polling window.
 
-> **Note on naming:** Despite the name `async_no_wait`, this mode **does wait**. It blocks the Airflow worker. The name reflects that it does not wait for the initial HTTP call to complete the job itself — it submits and then polls. See [Section 13](#13-async-node--how-polling-works) for full detail.
+**This mode requires a `status` block in the run-time conf.** Without it the task fails immediately with a message telling you exactly what is missing.
 
-### `fire_and_forget`
+Polling behaviour:
+- Continues while remote status is in `running_statuses`
+- Succeeds when remote status is in `success_statuses`
+- Fails when remote status is in `failure_statuses`
+- Times out and fails if no terminal state is reached within `timeout` seconds
 
-Makes an HTTP call and immediately marks success regardless of what the service does with it. No polling. No tracking.
+### fire_and_forget
 
-```
-submit → mark success (whether the job runs or not)
-```
+Submits the job and immediately marks the task as done. No polling, no tracking, no care about the outcome. Correct for notifications, audit events, side effects.
 
-> `fire_and_forget` nodes **cannot** use `branch_on_status: true`. They are also **excluded from merge guards** — downstream nodes do not wait for them to complete.
+Fire-and-forget tasks are excluded from the merge guard — downstream merge nodes do not wait for them to confirm anything beyond the initial HTTP submit going through.
 
 ---
 
-## 8. Parallel Lanes and Layer Structure
+## DAG structure
 
-Nodes with the **same `executor_order_id`** run in parallel. Different `executor_sequence_id` values within the same order distinguish them.
-
-```
-executor_order_id=1  →  task1 (seq=1)
-executor_order_id=2  →  task2 (seq=1), task3 (seq=2), task4 (seq=3)   ← parallel
-executor_order_id=3  →  task5 (seq=1)
-```
-
-Airflow graph:
-
-```
-         task1
-    ┌──────┼──────┐
-  task2  task3  task4
-    └──────┼──────┘
-         task5
-```
-
-Parent-child wiring for parallel layers:
-- If the next layer has **one node**, all parents wire to it.
-- If the next layer has **multiple nodes**, each child is wired to the parent with the **same `executor_sequence_id`**.
-
----
-
-## 9. Branching
-
-Set `branch_on_status: true` on a node to make it route to different downstream nodes based on whether it succeeded or failed.
-
-### Build payload
-
-```json
-{
-  "id": "task2",
-  "name": "KK_Validation",
-  "executor_order_id": 2,
-  "executor_sequence_id": 1,
-  "execution_mode": "sync",
-  "branch_on_status": true,
-  "on_success_node_ids": ["task3"],
-  "on_failure_node_ids": ["task4"]
-}
-```
-
-### What gets generated
-
-A `BranchPythonOperator` named `branch__KK_Validation` is inserted immediately after `KK_Validation`. It reads the `{node_id}_branch` XCom key and routes to either the success or failure target list.
-
-```
-KK_Validation
-      │
-branch__KK_Validation
-      ├── success → task3
-      └── failure → task4
-```
-
-### Rules
-
-| Rule | Enforced at |
-|------|------------|
-| `branch_on_status: true` requires at least one of `on_success_node_ids` or `on_failure_node_ids` | Build (422) |
-| `branch_on_status: false` must have empty branch target lists | Build (422) |
-| All node IDs in branch targets must exist in the nodes list | Build (422) |
-| A node ID cannot appear in both success and failure lists | Build (422) |
-| `fire_and_forget` nodes cannot have `branch_on_status: true` | Build (422) |
-
----
-
-## 10. Merging
-
-When two or more branches converge back to a single node, that node is automatically detected as a **merge node** at build time.
-
-### How merge is detected
-
-If a node has more than one upstream task in the dependency graph, it is a merge node.
-
-### What is applied to merge nodes
-
-1. **Trigger rule:** `NONE_FAILED_MIN_ONE_SUCCESS` — the merge node fires as long as at least one upstream succeeded and none failed. Airflow-skipped branches (from `BranchPythonOperator`) do not block execution.
-
-2. **Merge guard:** At runtime, before executing, the merge node calls `_check_merge_guard()` which inspects the XCom `{node_id}_task_state` of every non-fire-and-forget upstream node:
-
-| Upstream XCom state | In branch skip whitelist? | Decision |
-|--------------------|--------------------------|---------|
-| `"success"` | any | ✅ Pass |
-| empty/None | Yes | ✅ Pass (expected branch skip) |
-| empty/None | No | ❌ Fail — unexpected skip |
-| `"failed"` | any | ❌ Fail |
-
-`fire_and_forget` upstream nodes are **excluded** from this check entirely.
-
-### Example
-
-```
-task1 (branch_on_status: true)
-  ├── success → task2
-  └── failure → task3
-              ↓
-           task4   ← merge node
-```
-
-If task1 succeeds → task2 runs, task3 is Airflow-skipped → task4 runs (task3 skip is expected, whitelisted).
-If task1 fails → task3 runs, task2 is Airflow-skipped → task4 runs (task2 skip is expected, whitelisted).
-
----
-
-## 11. Why TaskGroup Was Removed
-
-### What TaskGroup does
-
-`TaskGroup` in Airflow is a **UI-only visual grouping**. It draws a collapsible box around tasks in the graph view. It has zero effect on execution order, dependency logic, trigger rules, or performance.
-
-In the original code, every `executor_order_id` layer was wrapped in a `TaskGroup` named `stage_N`.
-
-### Why it was removed
-
-| Problem | Impact |
-|---------|--------|
-| Task IDs become `stage_3.KK_File_DB` instead of `KK_File_DB` | XCom lookups by `task_ids=` break unless the full prefixed ID is used |
-| Branch task IDs become `stage_3.branch__KK_File_DB` | `choose_branch` and `finalize_results` must know the prefix |
-| The node `name` you provide no longer matches the task ID visible in the UI | Violates the "name = task ID" contract |
-| For small DAGs (≤15 nodes) it adds navigation friction, not clarity | Collapsing a 3-node group saves no scrolling |
-
-### When you should add TaskGroup back
-
-Only if you have **20+ nodes** and want the Airflow graph to be navigable. If you do, be sure to:
-- Prefix all XCom `task_ids=` lookups with the group ID
-- Update `TASK_ID_MAP` to include the group prefix
-- Update `choose_branch` and `finalize_results` accordingly
-
----
-
-## 12. Run Phase — Triggering the DAG
-
-### Via Airflow REST API
-
-```bash
-curl -X POST \
-  "http://<airflow-host>/api/v1/dags/demo_10_dag/dagRuns" \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Basic <base64>" \
-  -d '{
-    "logical_date": "2026-05-05T10:00:00Z",
-    "conf": {
-      "correlation_id": "your-trace-id",
-      "resume": false,
-      "resume_from": null,
-      "force_rerun": false,
-      "force_rerun_nodes": [],
-      "task1": {
-        "url": "http://service/endpoint",
-        "method": "POST",
-        "headers": { "Authorization": "Bearer token" },
-        "json": { "key": "value" },
-        "timeout": 300,
-        "verify_ssl": false
-      },
-      "task2": { ... }
-    }
-  }'
-```
-
-### Conf key = node id (exact match)
-
-The key inside `conf` **must exactly match** the `id` from the build payload. If your node was built with `"id": "task3"`, the conf key must be `"task3"`. No sanitization, no aliases.
-
-### Per-node conf fields
-
-| Field | Required | Default | Description |
-|-------|----------|---------|-------------|
-| `url` | ✅ Yes | — | HTTP endpoint |
-| `method` | No | `POST` | HTTP verb |
-| `headers` | No | `{}` | Request headers |
-| `json` | No | `null` | JSON request body |
-| `params` | No | `{}` | Query string parameters |
-| `timeout` | No | `300` | Request timeout in seconds |
-| `verify_ssl` | No | `false` | SSL certificate verification |
-
-For async nodes, add a `status` block. See [Section 13](#13-async-node--how-polling-works).
-
----
-
-## 13. Async Node — How Polling Works
-
-An `async_no_wait` node submits a job and then polls a separate status endpoint until a terminal state is reached. The entire sequence happens **within a single Airflow task** — the worker slot is held throughout.
-
-### Step-by-step
-
-```
-1. HTTP POST to node.url  →  submit job
-2. Extract tracking_id from submit response
-3. Loop: HTTP GET/POST to status.url every poke_interval seconds
-4. Check response[response_status_key] against success/failure/running sets
-5. On SUCCESS → mark task success, push XCom, continue DAG
-6. On FAILURE → mark task failed, raise AirflowException
-7. On TIMEOUT → raise AirflowException with last response
-```
-
-### tracking_id resolution order
-
-The tracking_id is extracted from the submit response in this priority:
-
-1. `status.tracking_id` (explicit override in conf)
-2. `payload.tracking_id` (explicit override in conf)
-3. `response_body[response_id_key]` — key named by `response_id_key` (default: `"job_id"`)
-4. `response_body["run_id"]`
-5. `response_body["runId"]`
-6. `response_body["id"]`
-7. `response_body["jobId"]`
-8. `response_body["request_id"]`
-
-If none of these resolve a value, the task fails immediately with a clear error.
-
-### Async node conf structure
-
-```json
-"task3": {
-  "url": "https://orchestrator/jobs",
-  "method": "POST",
-  "headers": { "Authorization": "Basic abc=" },
-  "json": { "job_id": "abc", "payload": { ... } },
-  "timeout": 300,
-  "verify_ssl": false,
-  "response_id_key": "runId",
-  "status": {
-    "url": "https://orchestrator/jobs/{tracking_id}",
-    "method": "GET",
-    "headers": { "Authorization": "Basic abc=" },
-    "response_status_key": "status",
-    "poke_interval": 15,
-    "timeout": 3600,
-    "success_statuses": ["SUCCESS", "COMPLETED"],
-    "failure_statuses": ["FAILED", "ERROR", "ABORTED"],
-    "running_statuses": ["RUNNING", "PENDING", "IN_PROGRESS"]
-  }
-}
-```
-
-### Status URL template variables
-
-Available inside `status.url` and `status.json`:
-
-| Variable | Value |
-|----------|-------|
-| `{tracking_id}` | Resolved job/run ID |
-| `{job_id}` | Alias for tracking_id |
-| `{run_id}` | Alias for tracking_id |
-| `{node_id}` | Node's build-time id |
-| `{node_name}` | Node's build-time name |
-| `{dag_id}` | Airflow DAG ID |
-| `{dag_run_id}` | Airflow DAG run ID |
-| `{run_control_id}` | Top-level run_control_id |
-
-### Default status sets
-
-These apply if you don't provide custom sets:
-
-```
-SUCCESS: SUCCESS, SUCCEEDED, COMPLETED, DONE, FINISHED
-FAILURE: FAILED, FAILURE, ERROR, ERRORED, CANCELLED, CANCELED, ABORTED
-RUNNING: RUNNING, IN_PROGRESS, PENDING, QUEUED, SUBMITTED, PROCESSING, STARTED
-```
-
----
-
-## 14. Resume a Failed DAG Run
-
-### Top-level conf fields
-
-```json
-{
-  "conf": {
-    "correlation_id": "same-as-original-run",
-    "resume": true,
-    "resume_from": "task7",
-    "force_rerun": false,
-    "force_rerun_nodes": []
-  }
-}
-```
-
-### How resume works
-
-Resume operates at the **`executor_order_id` level** — not the individual node level.
-
-- Nodes with `executor_order_id` **strictly less than** the `resume_from` node's order → **skipped** (XCom markers set to success, no HTTP call)
-- Nodes with `executor_order_id` **equal to or greater than** `resume_from` node's order → **execute normally**
-- Idempotency still applies: if an eligible node already has a success entry in the runtime registry with the same `correlation_id` and payload hash, it skips the HTTP call automatically
-
-### force_rerun_nodes
-
-Force specific nodes to re-execute even if they are before the resume boundary:
-
-```json
-"force_rerun_nodes": ["task2", "task4"]
-```
-
-### force_rerun
-
-Set `"force_rerun": true` to bypass all idempotency and re-execute every node from scratch.
-
-### resume_from validation
-
-If `resume_from` is set to a node ID that was not in the build payload, the DAG **immediately raises an AirflowException** before any task runs:
-
-```
-AirflowException: [RESUME] resume_from='task99' is not a valid node ID.
-Valid node IDs: ['task1', 'task2', ..., 'task10']
-```
-
----
-
-## 15. Idempotency — Build and Runtime
-
-### Build-time idempotency
-
-When `POST /build_dag` is called, a SHA-256 hash is computed over the canonicalized payload (sorted nodes, sorted fields, stripped strings). If that hash already exists in `build_registry.json` **and** the DAG file still exists on disk, the existing entry is returned without generating a new file.
-
-If the DAG file has been deleted but the registry entry remains, the stale entry is removed and a fresh file is generated.
-
-### Runtime idempotency
-
-Before each node's HTTP call, a key is computed from:
-
-```
-SHA-256 of {
-  dag_id,
-  run_control_id,
-  correlation_id,
-  node_id,
-  SHA-256 of node's conf payload
-}
-```
-
-If this key has a `"state": "success"` entry in `runtime_registry.json`, the HTTP call is skipped and the previous result is replayed via XCom. This means re-triggering the same DAG with the same `correlation_id` and same conf is safe.
-
-To bypass runtime idempotency for specific nodes: `"force_rerun_nodes": ["task3"]`
-To bypass for all nodes: `"force_rerun": true`
-
----
-
-## 16. Kafka Events
-
-Two events are produced per DAG run, both to `KAFKA_RUN_TOPIC`.
-
-### run.started.v1 — sent before any node tasks run
-
-```json
-{
-  "eventType": "run.started.v1",
-  "run_control_id": "DEMO_10",
-  "correlation_id": "your-trace-id",
-  "event_source": "AIRFLOW",
-  "status": "RUNNING",
-  "trigger_payload": "{ ... full conf as JSON string ... }",
-  "dagId": "demo_10_dag",
-  "dagRunId": "manual__2026-05-05T10:00:00+00:00",
-  "timestamp": "2026-05-05T10:00:01Z"
-}
-```
-
-### run.succeeded.v1 / run.failed.v1 — sent after all nodes complete
-
-```json
-{
-  "eventType": "run.succeeded.v1",
-  "run_control_id": "DEMO_10",
-  "correlation_id": "your-trace-id",
-  "event_source": "AIRFLOW",
-  "status": "SUCCESS",
-  "trigger_payload": "{ ... }",
-  "dagId": "demo_10_dag",
-  "dagRunId": "manual__2026-05-05T10:00:00+00:00",
-  "timestamp": "2026-05-05T10:05:22Z"
-}
-```
-
-The final event's `trigger_rule` is `ALL_DONE` — it fires even if the DAG failed.
-
----
-
-## 17. Error Handling Reference
-
-### Build phase errors
-
-| Error | HTTP | Cause | Action |
-|-------|------|-------|--------|
-| Duplicate node `id` | 422 | Two nodes share the same `id` | Make IDs unique |
-| Duplicate node `name` | 422 | Two nodes share the same `name` | Make names unique — names become Airflow task IDs |
-| Duplicate `(executor_order_id, executor_sequence_id)` | 422 | Two nodes in same position | Fix sequencing |
-| Unknown branch target | 422 | `on_success_node_ids` references a non-existent node | Fix the reference |
-| `branch_on_status: true` with no targets | 422 | No branch targets configured | Add at least one target |
-| `branch_on_status: false` with targets | 422 | Targets set but branching disabled | Set `branch_on_status: true` or remove targets |
-| Node in both success and failure targets | 422 | Same node in both lists | Remove from one list |
-| `fire_and_forget` with `branch_on_status: true` | 422 | Incompatible combination | Remove `branch_on_status` from fire_and_forget node |
-| Registry write failure | 500 + warning | Disk full or permission error | DAG file IS written; idempotency entry is NOT stored |
-| Generated code syntax error | 500 | Bug in code generator | File the issue |
-
-### Runtime errors (inside generated DAG)
-
-| Error | Behaviour | Recovery |
-|-------|-----------|----------|
-| Missing `url` in conf for a node | Task fails immediately | Add `url` to conf |
-| HTTP 401/403 | Task fails, XCom marked `failed` | Fix Authorization header |
-| HTTP non-2xx | Task fails, XCom marked `failed` | Fix endpoint or payload |
-| Network timeout/exception | Task fails, XCom marked `failed` | Check connectivity; use `force_rerun_nodes` to retry |
-| `async_no_wait` missing `status` block | Task fails immediately | Add `status` block to conf |
-| `async_no_wait` tracking_id not found | Task fails immediately | Add correct `response_id_key` or check submit response |
-| `async_no_wait` polling timeout | Task fails | Increase `status.timeout` or investigate external service |
-| `resume_from` unknown node ID | First task raises exception | Fix `resume_from` to use a valid node `id` |
-| Merge guard upstream failed | Merge node raises exception | Fix the failing upstream node and resume |
-| Merge guard unexpected skip | Merge node raises exception | Investigate why upstream had no XCom state |
-| `choose_branch` no failure targets | Branch router raises exception | Add `on_failure_node_ids` to the branching node in build payload |
-| portalocker not installed | RuntimeError on any task | `pip install portalocker` |
-
----
-
-## 18. Registry Files
-
-### build_registry.json
-
-Location: `$BUILD_IDEMPOTENCY_REGISTRY` (default: `<DAGS_DIR>/build_registry.json`)
-
-Stores one entry per unique build payload. Key = SHA-256 hash of the canonical payload.
-
-```json
-{
-  "<sha256>": {
-    "dag_id": "demo_10_dag",
-    "file": "demo_10_dag_20260505_100246.py",
-    "path": "/airflow/dags/demo_10_dag_20260505_100246.py",
-    "created_at": "2026-05-05T10:02:46.123456+00:00",
-    "payload_hash": "<sha256>",
-    "node_count": 10,
-    "airflow_version": "3.0.6"
-  }
-}
-```
-
-**Locking:** `build_registry.lock` (portalocker exclusive lock). The lock is held during both read and write as a context manager — released even on exception.
-
-### runtime_registry.json
-
-Location: `$RUNTIME_IDEMPOTENCY_REGISTRY` (default: `/tmp/dynamic_dag_runtime_registry.json`)
-
-Stores one entry per node execution attempt. Key = SHA-256 of `{dag_id, run_control_id, correlation_id, node_id, payload_hash}`.
-
-```json
-{
-  "<sha256>": {
-    "state": "success",
-    "node_id": "task3",
-    "node_name": "KK_File_DB",
-    "execution_mode": "async_no_wait",
-    "dag_id": "demo_10_dag",
-    "dag_run_id": "manual__2026-05-05T10:00:00+00:00",
-    "correlation_id": "your-trace-id",
-    "tracking_id": "job-abc-123",
-    "http_status": 202,
-    "submit_response": { ... },
-    "result": { ... },
-    "finished_at": "2026-05-05T10:03:45Z"
-  }
-}
-```
-
----
-
-## 19. DAG Structure — What Gets Generated
-
-Every generated DAG has this fixed skeleton:
+Every generated DAG looks like this regardless of what nodes you define:
 
 ```
 prepare_inputs
       │
-run_started_event  ← Kafka: run.started.v1
+run_started_event       ← publishes run.started.v1 to Kafka
       │
-   [your nodes, wired per executor_order_id layers]
+  [ your nodes ]        ← wired by executor_order_id layers
       │
-finalize_results   ← trigger_rule: ALL_DONE
+finalize_results        ← checks every node's XCom state (trigger_rule: ALL_DONE)
       │
-run_final_event    ← Kafka: run.succeeded.v1 or run.failed.v1
-                     trigger_rule: ALL_DONE
+run_final_event         ← publishes run.succeeded.v1 or run.failed.v1 (trigger_rule: ALL_DONE)
+      │
+completion              ← mirrors finalize_results outcome, sets DAG run status
 ```
 
-### XCom keys written per node
+**Why there is a `completion` node at the very end**
 
-| Key | Value | Description |
-|-----|-------|-------------|
-| `{node_id}_task_state` | `"started"` / `"success"` / `"failed"` | Primary state marker |
-| `{node_id}_branch` | `"success"` / `"failure"` | Used by BranchPythonOperator |
-| `{node_id}_response` | response body dict | HTTP response or poll result |
-| `{node_id}_error` | error message string | Set on failure |
-| `{node_id}_tracking_id` | tracking_id string | async_no_wait only |
-| `{node_id}_submit_response` | submit response body | async_no_wait and fire_and_forget |
-| `{node_id}_submit_http_status` | int | HTTP status of submit call |
-| `{node_id}_idempotency_key` | sha256 string | For debugging idempotency |
+Without it a DAG run where business tasks failed could still show green. The Kafka operator (`run_final_event`) always succeeds — it just sends a message. So the last task succeeded, Airflow marks the run green. Wrong.
 
-### Constants baked into the generated DAG
+`completion` reads the `final_status` XCom that `finalize_results` wrote and raises an exception if the outcome was `FAILED`. That is what pushes the overall run to red.
 
-These are resolved at build time and written as literals into the `.py` file:
+**How finalize_results works**
 
-| Constant | Description |
-|----------|-------------|
-| `RUN_CONTROL_ID` | The `run_control_id` from build payload |
-| `FINAL_NODE_IDS` | List of all node IDs |
-| `ASYNC_NODE_IDS` | IDs of async_no_wait nodes |
-| `FIRE_AND_FORGET_NODE_IDS` | IDs of fire_and_forget nodes |
-| `NODE_NAME_MAP` | `{node_id: node_name}` |
-| `BRANCH_SKIP_WHITELIST` | Task IDs that are valid Airflow-skipped targets |
-| `MERGE_NODE_IDS` | Task IDs with multiple upstreams |
-| `NODE_ORDER_MAP` | `{node_id: executor_order_id}` |
-| `TASK_ID_MAP` | `{node_id: airflow_task_id}` |
+Reads the `_task_state` XCom key from every node in the DAG. If any node wrote `failed`, or if any non-branch-skip node has no XCom at all, it raises and the run fails. Fire-and-forget nodes only need their submit to have gone through.
+
+**How nodes connect to finalize_results**
+
+Only the nodes in the final layer (highest `executor_order_id`) connect to `finalize_results` with a dependency arrow. This keeps the graph clean. `finalize_results` still inspects all nodes via XCom — the visible arrows and the health checking are separate things.
 
 ---
 
-## 20. Known Constraints and Rules
+## Branching and merging
 
-| Constraint | Detail |
-|-----------|--------|
-| Node `name` must be unique per DAG | Enforced at build time. Name IS the Airflow task ID. |
-| Node `id` must be unique per DAG | Enforced at build time. ID IS the conf key at run time. |
-| `(executor_order_id, executor_sequence_id)` must be unique | Enforced at build time. |
-| `fire_and_forget` cannot branch | No terminal state tracking means no reliable branch signal. |
-| `async_no_wait` must have a `status` block in conf | Fails immediately with clear error if missing. |
-| Merge nodes re-execute all peers in the same layer on resume | Resume is order-level granularity. Idempotency protects already-successful nodes. |
-| TaskGroup removed | Task IDs are flat. No group prefix. XCom lookups use the name directly. |
-| portalocker is required | Not optional. Missing it raises RuntimeError on any task. |
-| The generated DAG is a standalone Python file | It contains all runtime logic as embedded functions. No external imports from this service. |
-| `max_active_runs=1` | One run at a time per DAG. Prevents concurrent execution of the same workflow. |
+Set `branch_on_status: true` on a node to add a `BranchPythonOperator` immediately after it. The router reads the task's XCom outcome and sends execution down either `on_success_node_ids` or `on_failure_node_ids`.
+
+Rules:
+- `branch_on_status: true` requires at least one entry in one of the target lists
+- A node cannot appear in both lists simultaneously
+- `fire_and_forget` nodes cannot branch — they have no reliable terminal state
+- Merge nodes (where both branch paths rejoin) get `TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS` automatically so the skipped branch path does not block them
 
 ---
 
-## Version History
+## Resume and force-rerun
 
-| Version | Airflow | Changes |
-|---------|---------|---------|
-| 1.0.0 | 3.0.6 / 3.1.8 | Initial versioned release. All fixes from original merged file applied. TaskGroup removed. Node name = task ID. Merge guard added. Resume validation added. PydanticValidationError handler added. portalocker context manager fix. Template f-string escaping fixed. |
+### Resuming a failed run
+
+Trigger a new DAG run with `"resume": true` and `"resume_from": "<node_id>"`. Any node with `executor_order_id` less than the `resume_from` node's order gets skipped — it pushes a synthetic success XCom and returns without making any HTTP calls. Everything from `resume_from` onward runs normally.
+
+Always use the same `correlation_id` as the original failed run so Kafka events link up correctly.
+
+### Forcing specific nodes to re-run during resume
+
+Put node ids in `force_rerun_nodes`. Those tasks run fully even if they would normally be skipped by the resume boundary. Everything else follows the resume rules.
+
+Complete payload examples for both scenarios are in `PAYLOAD_REFERENCE.md`.
+
+---
+
+## XCom keys written by every task
+
+| Key | Written when | Value |
+|---|---|---|
+| `{node_id}_task_state` | Throughout | `started` on entry → `success` or `failed` on exit |
+| `{node_id}_branch` | On completion | `success` or `failure` |
+| `{node_id}_response` | On success | HTTP response body as parsed JSON |
+| `{node_id}_error` | On failure | Error message string |
+| `{node_id}_submit_response` | async_no_wait and fire_and_forget | Response body from the initial submit call |
+| `{node_id}_tracking_id` | async_no_wait only | Tracking ID extracted from the submit response |
+| `{node_id}_submit_http_status` | async_no_wait and fire_and_forget | HTTP status code of the submit call |
+
+`finalize_results` writes two additional keys:
+
+| Key | Value |
+|---|---|
+| `final_status` | `SUCCESS` or `FAILED` |
+| `final_summary` | Full JSON breakdown — which nodes succeeded, which failed, which were expected skips, which had no XCom |
+
+---
+
+## Kafka events
+
+| Event type | Fires when | `status` value |
+|---|---|---|
+| `run.started.v1` | After `prepare_inputs`, before any task runs | `Running` |
+| `run.succeeded.v1` | After `finalize_results` if outcome was SUCCESS | `Success` |
+| `run.failed.v1` | After `finalize_results` if outcome was FAILED | `Failure` |
+
+All events carry: `run_control_id`, `correlation_id`, `dagId`, `dagRunId`, `timestamp` (UTC ISO-8601), `status`, `trigger_payload` (the full conf as a JSON string).
+
+`run_final_event` runs with `trigger_rule=ALL_DONE` so you always get a terminal Kafka event regardless of whether the business tasks passed or failed.
+
+---
+
+## Build-time idempotency
+
+Every `/build_dag` call computes a SHA-256 hash of the canonicalised node list. If that hash already exists in `build_registry.json` the service returns the existing entry without touching the file. Same payload, same result, no extra work.
+
+Change anything on any node — mode, order, name, build id — and the hash changes, triggering a fresh write.
+
+The registry exists only on the FastAPI VM. There is no runtime registry on the Airflow VM.
+
+---
+
+## HTTP retry behaviour
+
+All HTTP calls inside generated DAG tasks go through the retry wrapper. It uses tenacity with exponential backoff.
+
+**Retried automatically:** `ConnectionError`, `Timeout`, `ChunkedEncodingError`, HTTP 500 / 502 / 503 / 504 / 429.
+
+**Not retried:** HTTP 400, 401, 403, 404, 422. These are caller errors — sending the same request again will not fix them.
+
+When retries run out the error in the Airflow task log includes the method, URL, attempt count, and last exception so you know exactly what was being called when it gave up.
+
+---
+
+## Error log format
+
+Every HTTP failure from a generated task writes a structured diagnostic block to the Airflow task log:
+
+```
+  Node       : task1 (murex-script-execution)
+  Build ID   : EDM_Location_Inbound_NAS_TO_PVC
+  Stage      : submit
+  ── Request ──────────────────────────
+  Method     : POST
+  URL        : http://your-service/api/execute
+  Params     : None
+  Body       : {"run_id": "abc123", "payload": null}
+  ── Response ─────────────────────────
+  HTTP Status: 422
+  Body       : {"detail": [{"type":"missing","loc":["body"],"msg":"Field required"}]}
+  Hint       : HTTP 422 — downstream service rejected the body.
+               A required field is null or missing. Check the 'json' block
+               under 'EDM_Location_Inbound_NAS_TO_PVC' in your run conf.
+```
+
+| HTTP | Usually means | Where to look |
+|---|---|---|
+| 401 / 403 | Auth failure | `headers.Authorization` in the run conf for this node |
+| 404 | URL does not exist | The `url` field in the run conf |
+| 422 | Body missing a required field | The `json` block in the run conf — something is null |
+| 500–504 | Downstream server error | Will retry; check the downstream service logs if all retries fail |
+| Network error | Service unreachable | Connectivity from the Airflow worker to that URL |
+
+Passwords, secrets, tokens, and API keys in the request body are redacted before the log line is written.
+
+---
+
+## Known gaps
+
+**async_no_wait holds a worker slot.** Long-running jobs keep a worker occupied for the full polling duration. Deferrable operators would fix this — on the backlog.
+
+**No URL allowlist.** Any URL reachable from the Airflow worker can be called. `ALLOWED_URL_PREFIXES` env var guard is on the backlog.
+
+**Kafka failures are not caught.** If the broker is down, `ProduceToTopicOperator` fails with no fallback. A try/except wrapper with log fallback is on the backlog.
+
+**Large XCom values.** Big HTTP response bodies are stored in the Airflow metadata database as-is. Truncation logic is on the backlog.
+
+---
+
+## Version history
+
+### v1.3 (current)
+- `executor_build_id` is now required — no fallback to `name`
+- `executor_build_id` is the primary run-time conf lookup key — `resolve_payload` checks `conf[executor_build_id]` first
+- Kafka status values changed to title case: `Running`, `Success`, `Failure`
+- Code comments updated throughout to clarify the three-field role split
+
+### v1.2
+- Runtime idempotency removed — portalocker and lock files gone from the Airflow VM
+- `executionSteps` accepted as alias for `nodes` in the build payload
+- Node `id` auto-assigned if omitted
+- Duplicate node names allowed — deduplicated as `{name}_{order}_{seq}`
+- `completion` terminal node added
+- Only terminal layer nodes wire to `finalize_results` — cleaner graph
+- HTTP error messages enriched with method, URL, body, response, and per-status hints
+
+### v1.1
+- DAG filenames no longer include a timestamp — always `{dag_id}.py`
+- HTTP retry with tenacity on all HTTP calls
+- Cycle detection at build time
+- TaskGroup removed (was breaking XCom prefixes)
+- Template f-string escaping fixed
+
+### v1.0
+- Initial release

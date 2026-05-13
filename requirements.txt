@@ -1,0 +1,80 @@
+# =============================================================
+# requirements.txt
+# Dynamic DAG Service — airflow_job1 v1.2
+#
+# Two separate sections below.
+# Read carefully — the FastAPI VM and the Airflow VM need
+# different packages. Installing everything on both machines
+# will work but is wasteful.
+# =============================================================
+
+
+# -------------------------------------------------------------
+# SECTION 1 — FastAPI VM
+# The machine that runs dynamic_dag_service.py.
+# This is the service that receives /build_dag requests and
+# writes the .py DAG files to disk.
+# -------------------------------------------------------------
+
+# Web framework
+fastapi>=0.110.0
+
+# ASGI server — the [standard] extra pulls in httptools and
+# uvloop for better performance on Linux
+uvicorn[standard]>=0.29.0
+
+# Data validation — must be v2 or higher, v1 is not supported
+pydantic>=2.0.0
+
+# File locking used by the build-time registry on the FastAPI VM.
+# Not needed on the Airflow VM (runtime idempotency was removed in v1.2).
+portalocker>=2.8.0
+
+# Retry logic — used in the generated DAG code at runtime.
+# Listed here so the FastAPI VM has it available for local testing.
+tenacity>=8.2.0
+
+# HTTP client — used inside generated DAG tasks.
+# Listed here for completeness and local testing.
+requests>=2.31.0
+
+
+# -------------------------------------------------------------
+# SECTION 2 — Airflow VM
+# The machine(s) running the Airflow scheduler and workers.
+# Install these inside the Airflow worker environment or
+# Docker image, not on the FastAPI VM (unless they overlap).
+# -------------------------------------------------------------
+
+# Airflow core — this project targets 3.0.6 specifically.
+# The [standard] extra includes the providers needed for
+# PythonOperator and BranchPythonOperator.
+# Uncomment the line that matches your deployment target.
+#
+# Dev environment (Airflow 3.0.6):
+apache-airflow[standard]>=3.0.6,<3.1.0
+#
+# Production environment (Airflow 3.1.8) — uncomment and
+# comment out the line above:
+# apache-airflow[standard]>=3.1.8,<3.2.0
+
+# Kafka provider — needed for ProduceToTopicOperator which
+# emits run.started and run.succeeded/failed events.
+apache-airflow-providers-apache-kafka>=1.4.0
+
+# Standard operators provider — PythonOperator, BranchPythonOperator.
+# This is separate from the core package in Airflow 3.x.
+apache-airflow-providers-standard>=0.0.3
+
+# HTTP calls inside generated task code
+requests>=2.31.0
+
+# Retry logic inside generated task code.
+# If tenacity is not installed on the worker, retries are
+# silently disabled and a warning is logged. It will not crash,
+# but you should install it.
+tenacity>=8.2.0
+
+# NOTE: portalocker is intentionally absent here.
+# Runtime idempotency was removed in v1.2. The Airflow VM
+# no longer needs portalocker at all.
