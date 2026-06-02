@@ -75,6 +75,7 @@ logger = logging.getLogger("dynamic-dag-service")
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="Dynamic Airflow DAG Service", version="1.3.0-airflow306")
+CODE_GENERATION_VERSION = "1.3.1-run-conf-wrapper"
 
 # Where the generated .py files land.  Airflow watches this folder.
 # On the FastAPI VM this should point at the git-synced folder or shared mount
@@ -481,6 +482,7 @@ def canonicalize_build_payload(payload: BuildDagPayload) -> Dict[str, Any]:
         for node in ordered_nodes
     ]
     return {
+        "code_generation_version": CODE_GENERATION_VERSION,
         "run_control_id": payload.run_control_id,
         "trigger_type": payload.trigger_type,
         "schedule": payload.schedule,
@@ -1371,12 +1373,30 @@ def resolve_payload(conf, node_id, executor_build_id, task_key=None, global_seq=
     Look up this node's payload from dag_run.conf.
 
     Lookup order:
-      1. conf[executor_build_id]  -- primary key, e.g. "ICE_FILE_TRANSFER_1"
-      2. conf[node_id]            -- same as executor_build_id in most cases
-      3. conf[task_key]           -- legacy fallback
-      4. conf["taskN"]            -- positional fallback: "task1"/"Task1" maps to global_seq=1
-      5. scan for node_runId match
+      1. direct dag_run.conf keys, e.g. conf[executor_build_id]
+      2. wrapped API body keys, e.g. conf["conf"][executor_build_id]
+      3. legacy task_key / positional taskN aliases
+      4. scan for node_runId match
     \"\"\"
+    payload_containers = [conf]
+    for wrapper_key in ("conf", "payload", "trigger_payload"):
+        wrapped = conf.get(wrapper_key) if isinstance(conf, dict) else None
+        if isinstance(wrapped, str):
+            try:
+                wrapped = json.loads(wrapped)
+            except Exception:
+                wrapped = None
+        if isinstance(wrapped, dict):
+            payload_containers.append(wrapped)
+    candidate_keys = [str(v).strip().lower() for v in (executor_build_id, node_id, task_key) if v]
+    if global_seq is not None:
+        candidate_keys.append(f"task{{global_seq}}")
+    conf = payload_containers[0]
+    for candidate_container in payload_containers:
+        normalized_keys = set(str(k).strip().lower() for k in candidate_container.keys())
+        if any(key in normalized_keys for key in candidate_keys):
+            conf = candidate_container
+            break
     conf_normalized = {{str(k).strip().lower(): v for k, v in conf.items()}}
     node_id_l = str(node_id).lower()
     exec_id_l = str(executor_build_id).lower() if executor_build_id else None
@@ -1414,6 +1434,24 @@ def resolve_payload(conf, node_id, executor_build_id, task_key=None, global_seq=
             return value
 
     return {{}}
+
+
+def _normalize_request_payload(payload):
+    \"\"\"Accept request controls either beside json or inside the json block.\"\"\"
+    if not isinstance(payload, dict):
+        return payload
+    normalized = dict(payload)
+    body = normalized.get("json")
+    if not isinstance(body, dict):
+        return normalized
+
+    body = dict(body)
+    control_keys = ("method", "headers", "params", "timeout", "verify_ssl", "status", "response_id_key", "tracking_id")
+    for key in control_keys:
+        if key in body and key not in normalized:
+            normalized[key] = body.pop(key)
+    normalized["json"] = body
+    return normalized
 
 
 # ---------------------------------------------------------------------------
@@ -1474,6 +1512,7 @@ def execute_node(
         _check_merge_guard(ti, node_id, upstream_guard_node_ids)
 
     payload = resolve_payload(conf, node_id=node_id, executor_build_id=executor_build_id, task_key=task_key, global_seq=global_seq)
+    payload = _normalize_request_payload(payload)
 
     # Resume
     if conf.get("resume") and not _should_force_rerun(conf, node_id):
@@ -1498,7 +1537,7 @@ def execute_node(
             f"  Missing or empty 'url' in conf.\\n"
             f"  Expected conf key: '{{executor_build_id}}'\\n"
             f"  The run-time conf must have an entry keyed by executor_build_id, e.g.:\\n"
-            f"    {{ '{{executor_build_id}}': {{ 'url': 'http://...', 'json': {{...}} }} }}"
+            "    {{ '" + executor_build_id + "': {{ 'url': 'http://...', 'json': {{...}} }} }}"
         )
 
     ti.xcom_push(key=f"{{node_id}}_task_state", value="started")
@@ -1963,6 +2002,7 @@ def build_dag(payload: BuildDagPayload) -> Dict[str, Any]:
         "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "payload_hash": idempotency_key,
+        "code_generation_version": CODE_GENERATION_VERSION,
         "node_count": len(payload.nodes),
         "airflow_version": "3.0.6",
     }
