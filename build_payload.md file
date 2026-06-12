@@ -1,0 +1,1263 @@
+# Build DAG — Payload Models Reference
+
+**Endpoint:** `POST /build_dag`  
+**Service:** `dag_service_latest.py` v1.3  
+
+---
+
+## BuildDagPayload (top-level)
+
+```jsonc
+{
+  "run_control_id": "string",
+  "triggerType": "string",
+  "schedule": "string | null",
+  "executionSteps": [ ...Node ],
+  "nodes": [ ...Node ]
+}
+```
+
+| Field | Type | Required | Accepted Values | Notes |
+|---|---|---|---|---|
+| `run_control_id` | string | **Yes** | any non-empty string | Sanitized to lowercase and used to create Airflow `dag_id` as `<sanitized_run_control_id>_dag`. Cannot be null or blank |
+| `triggerType` | string | No | `"0"`-`"4"` or `"O"`, `"S"`, `"F"`, `"D"`, `"R"` | Numeric values are mapped internally to their letter equivalents. This field does not control the generated schedule |
+| `schedule` | string \| null | No | Airflow-compatible schedule string | Any non-empty value is emitted as the DAG schedule, regardless of `triggerType` |
+| `executionSteps` | array of Node | Yes* | array | Preferred field name for node list |
+| `nodes` | array of Node | Yes* | array | Alias for `executionSteps`. Both accepted and merged internally |
+
+> *At least one node required across `executionSteps` + `nodes` combined.
+
+---
+
+## Node (each item in executionSteps / nodes)
+
+```json
+{
+  "id": "string",
+  "name": "string",
+  "executor_build_id": "string",
+  "engine": "PYTHON",
+  "executor_order_id": 1,
+  "executor_sequence_id": 1,
+  "execution_mode": "sync",
+  "branch_on_status": false,
+  "on_success_node_ids": [],
+  "on_failure_node_ids": []
+}
+```
+
+| Field | Type | Required | Default | Notes |
+|---|---|---|---|---|
+| `id` | string | No | Auto: `task1`, `task2`... | Internal wiring ID. Used in `on_success_node_ids` / `on_failure_node_ids` references. Never shown in Airflow UI. **Must be set explicitly when using branching.** |
+| `name` | string | **Yes** | — | Shown as the task label in Airflow graph view. If same name appears in multiple layers it is auto-deduplicated as `name_order_seq` |
+| `executor_build_id` | string | **Yes** | — | The key the task uses at **run time** to look up its HTTP parameters from `dag_run.conf`. Not the same as `id` or `name` |
+| `engine` | string | **Yes** | — | Any non-empty string is accepted and included as metadata. Generated execution remains HTTP/Python-based |
+| `executor_order_id` | integer ≥ 1 | **Yes** | — | Layer number. Same-layer nodes may run in parallel. Cross-layer wiring follows the sequence-based rules below |
+| `executor_sequence_id` | integer ≥ 1 | **Yes** | — | Position within a layer. No two nodes can share the same `(executor_order_id, executor_sequence_id)` pair |
+| `execution_mode` | string | No | `"sync"` | See execution mode table below |
+| `branch_on_status` | boolean | No | `false` | Set `true` to route downstream tasks based on the node's final execution status. At least one branch target is required |
+| `on_success_node_ids` | array of string | Required if branching | `[]` | List of `id` values selected when the node's branch marker is `success` |
+| `on_failure_node_ids` | array of string | Required if branching | `[]` | List of `id` values selected when the node's branch marker is missing, failed, or otherwise not `success` |
+
+---
+
+## Execution Mode
+
+| Value | Waits for response | Fails DAG on non-2xx | Can branch |
+|---|---|---|---|
+| `sync` | Yes | Yes | Yes |
+| `async_no_wait` | Yes: submits, then polls status until terminal | Yes, when polling returns a failure/unknown/timeout result | Yes |
+| `fire_and_forget` | Waits only for the initial HTTP submission response | Yes, when the initial submission is non-2xx or raises | No |
+
+---
+
+## triggerType Mapping
+
+| Payload value | Internal code | Meaning |
+|---|---|---|
+| `"0"` | `O` | On-demand |
+| `"1"` | `S` | Scheduled (cron) |
+| `"2"` | `F` | Reserved |
+| `"3"` | `D` | Reserved |
+| `"4"` | `R` | Reserved |
+
+> The current service does not enforce a relationship between `triggerType` and `schedule`. A non-empty `schedule` produces a scheduled DAG even when `triggerType` is omitted or set to `"0"`.
+
+---
+
+## Validation Rules (enforced at build time — 422 on failure)
+
+| Rule | Detail |
+|---|---|
+| `run_control_id` required | Cannot be null, empty, or whitespace |
+| At least one node | `executionSteps` + `nodes` combined must have ≥ 1 node |
+| Unique `id` | No two nodes can have the same `id` after auto-assignment |
+| Unique `(order, seq)` pair | No two nodes can share `executor_order_id` + `executor_sequence_id` |
+| Branch references must exist | `on_success_node_ids` and `on_failure_node_ids` must point to `id` values that exist in the same payload |
+| `branch_on_status: true` requires targets | At least one target across `on_success_node_ids` and `on_failure_node_ids` must be present. Configure both lists when both outcomes must continue |
+| No overlap between success and failure lists | A node cannot appear in both lists of the same parent |
+| `fire_and_forget` cannot branch | `execution_mode: fire_and_forget` with `branch_on_status: true` is rejected |
+| No cycles | Circular dependencies via `executor_order_id` layers or branch targets are rejected |
+| Non-empty string fields | `executor_build_id`, `engine`, and `name` cannot be null or blank |
+
+---
+
+## Auto-behaviours (no payload flag needed)
+
+| Behaviour | Trigger condition | What happens |
+|---|---|---|
+| Auto ID assignment | `id` field is empty or omitted | Assigned as `task1`, `task2`... sorted by `executor_order_id` ASC then `executor_sequence_id` ASC |
+| Name deduplication | Same `name` in multiple layers | Airflow task_id becomes `name_order_seq` automatically |
+| Merge node detection | A node appears as downstream of more than one parent | `TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS` applied + merge guard XCom check added |
+| Orphan detection | A node has no generated downstream business child | Auto-wired to `finalize_results` so the DAG terminates cleanly |
+
+### Current Cross-Layer Wiring Rules
+
+The implementation does not always make every node in layer N+1 wait for every node in layer N:
+
+1. Every node in the first layer is wired from `run_started_event`.
+2. When the next layer contains exactly one node, every non-branch node in the previous layer is wired to it.
+3. When the next layer contains multiple nodes, a non-branch node is wired only to the next-layer node with the same `executor_sequence_id`.
+4. Branch-source nodes do not receive structural outbound edges; their explicit success/failure targets define their outbound wiring.
+5. A node with no generated downstream business edge is treated as terminal/orphan and wired to `finalize_results`.
+
+Keep sequence IDs aligned deliberately. A multi-node next layer with unmatched sequence IDs can create tasks with no upstream dependency.
+
+### Implementation Accuracy Notes
+
+- `run_control_id` is sanitized and converted to `<sanitized_run_control_id>_dag`; it is not used verbatim as the Airflow DAG ID.
+- `engine` is validated only as a non-empty string. The service does not currently enforce `"PYTHON"`.
+- Nodes sharing an `executor_order_id` are in the same layer, but their actual upstream dependencies still depend on the cross-layer wiring rules above.
+- A one-sided branch is accepted at build time, but the generated branch operator raises an `AirflowException` if the empty side is selected. Use both success and failure targets for runtime-safe branching.
+- Branch recovery routes do not erase the original failed task state. A failed branch-source task can still make the final DAG result fail even when its failure route runs successfully.
+- The current generated branch skip whitelist stores Airflow task names, while finalization compares internal node IDs. When `id` and `name` differ, an intentionally skipped branch can be reported as an unexpected skip and fail finalization.
+- Node `name` is used directly as the Airflow `task_id`. Keep names Airflow-safe, unique after generated suffixing, and avoid generated task IDs such as `prepare_inputs`, `run_started_event`, `finalize_results`, `run_final_event`, and `completion`.
+
+---
+
+## Topology Index
+
+| # | Topology | Key fields |
+|---|---|---|
+| 1 | Single node | 1 node, no branching |
+| 2 | Linear chain | N nodes, sequential layers |
+| 3 | Scheduled linear chain | `triggerType: "1"` + cron |
+| 4 | Parallel (same layer) — structural | Multiple nodes share `executor_order_id` |
+| 5 | Parallel then merge — structural | Parallel layer feeds one merge node |
+| 6 | Conditional branch — success only | `branch_on_status: true`, `on_success_node_ids` only |
+| 7 | Conditional branch — failure only | `branch_on_status: true`, `on_failure_node_ids` only |
+| 8 | Conditional branch — both paths | `branch_on_status: true`, success + failure each route to different nodes |
+| 9 | Conditional branch — parallel success split | Success routes to multiple nodes that then merge |
+| 10 | Orphan node | Non-final node with no downstream children, auto-wired to `finalize_results` |
+| 11 | Mixed execution modes | `sync` + `async_no_wait` + `fire_and_forget` in one DAG |
+| 12 | Multi-layer with parallel and branch | Full real-world pipeline |
+| 13 | Conditional branch inside parallel layer | Two parallel nodes, one branches |
+| 14 | Chained branches (branch after branch) | Branch node downstream is itself a branch node |
+| 15 | Conditional branch into three nodes, then merge | Success selects three parallel nodes; success and failure paths merge |
+
+---
+
+## Topology 1 — Single Node
+
+Simplest possible DAG. One task, runs, done.
+
+```
+run_started_event --> extract_data --> finalize_results --> run_final_event --> completion
+```
+
+```json
+{
+  "run_control_id": "single_node_demo",
+  "triggerType": "0",
+  "schedule": null,
+  "executionSteps": [
+    {
+      "id": "extract",
+      "name": "extract_data",
+      "executor_build_id": "EXTRACT_DATA_API",
+      "engine": "PYTHON",
+      "executor_order_id": 1,
+      "executor_sequence_id": 1,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    }
+  ]
+}
+```
+
+---
+
+## Topology 2 — Linear Chain (Sequential)
+
+Each node runs after the previous one completes. Different `executor_order_id` per node.
+
+```
+extract --> transform --> load --> finalize_results
+```
+
+```json
+{
+  "run_control_id": "linear_chain_demo",
+  "triggerType": "0",
+  "schedule": null,
+  "executionSteps": [
+    {
+      "id": "extract",
+      "name": "extract_data",
+      "executor_build_id": "EXTRACT_DATA_API",
+      "engine": "PYTHON",
+      "executor_order_id": 1,
+      "executor_sequence_id": 1,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    },
+    {
+      "id": "transform",
+      "name": "transform_data",
+      "executor_build_id": "TRANSFORM_DATA_API",
+      "engine": "PYTHON",
+      "executor_order_id": 2,
+      "executor_sequence_id": 1,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    },
+    {
+      "id": "load",
+      "name": "load_data",
+      "executor_build_id": "LOAD_DATA_API",
+      "engine": "PYTHON",
+      "executor_order_id": 3,
+      "executor_sequence_id": 1,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    }
+  ]
+}
+```
+
+---
+
+## Topology 3 — Scheduled Linear Chain
+
+Same as Topology 2 but runs on a cron schedule instead of on-demand.
+
+- `schedule` — the field that actually makes the generated DAG scheduled
+- `triggerType: "1"` — descriptive scheduled type; currently not coupled to `schedule` by validation
+
+```json
+{
+  "run_control_id": "scheduled_etl_daily",
+  "triggerType": "1",
+  "schedule": "0 6 * * *",
+  "executionSteps": [
+    {
+      "id": "extract",
+      "name": "extract_data",
+      "executor_build_id": "EXTRACT_DATA_API",
+      "engine": "PYTHON",
+      "executor_order_id": 1,
+      "executor_sequence_id": 1,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    },
+    {
+      "id": "transform",
+      "name": "transform_data",
+      "executor_build_id": "TRANSFORM_DATA_API",
+      "engine": "PYTHON",
+      "executor_order_id": 2,
+      "executor_sequence_id": 1,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    },
+    {
+      "id": "load",
+      "name": "load_data",
+      "executor_build_id": "LOAD_DATA_API",
+      "engine": "PYTHON",
+      "executor_order_id": 3,
+      "executor_sequence_id": 1,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    }
+  ]
+}
+```
+
+> Cron examples: `"0 6 * * *"` = daily at 06:00, `"0 */4 * * *"` = every 4 hours, `"0 9 * * 1"` = every Monday at 09:00.
+
+---
+
+## Topology 4 — Parallel Nodes (Structural)
+
+Multiple nodes share the same `executor_order_id`. They all start at the same time and the next layer waits for all of them to finish.
+
+```
+run_started_event
+    |
+    +--> ingest_source_a  (order=1, seq=1) --|
+    +--> ingest_source_b  (order=1, seq=2) --|
+    +--> ingest_source_c  (order=1, seq=3) --|
+                                              |
+                                    finalize_results
+```
+
+```json
+{
+  "run_control_id": "parallel_ingest_demo",
+  "triggerType": "0",
+  "schedule": null,
+  "executionSteps": [
+    {
+      "id": "ingest_a",
+      "name": "ingest_source_a",
+      "executor_build_id": "INGEST_SOURCE_A_API",
+      "engine": "PYTHON",
+      "executor_order_id": 1,
+      "executor_sequence_id": 1,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    },
+    {
+      "id": "ingest_b",
+      "name": "ingest_source_b",
+      "executor_build_id": "INGEST_SOURCE_B_API",
+      "engine": "PYTHON",
+      "executor_order_id": 1,
+      "executor_sequence_id": 2,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    },
+    {
+      "id": "ingest_c",
+      "name": "ingest_source_c",
+      "executor_build_id": "INGEST_SOURCE_C_API",
+      "engine": "PYTHON",
+      "executor_order_id": 1,
+      "executor_sequence_id": 3,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    }
+  ]
+}
+```
+
+---
+
+## Topology 5 — Parallel Nodes then Structural Merge
+
+Three nodes run in parallel. All three feed into one merge node in the next layer. The merge node gets `TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS` automatically.
+
+```
+run_started_event
+    |
+    +--> process_region_a (order=1, seq=1) --|
+    +--> process_region_b (order=1, seq=2) --+--> aggregate_results (order=2, seq=1)
+    +--> process_region_c (order=1, seq=3) --|
+                                              |
+                                    finalize_results
+```
+
+```json
+{
+  "run_control_id": "parallel_merge_demo",
+  "triggerType": "0",
+  "schedule": null,
+  "executionSteps": [
+    {
+      "id": "region_a",
+      "name": "process_region_a",
+      "executor_build_id": "PROCESS_REGION_A_API",
+      "engine": "PYTHON",
+      "executor_order_id": 1,
+      "executor_sequence_id": 1,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    },
+    {
+      "id": "region_b",
+      "name": "process_region_b",
+      "executor_build_id": "PROCESS_REGION_B_API",
+      "engine": "PYTHON",
+      "executor_order_id": 1,
+      "executor_sequence_id": 2,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    },
+    {
+      "id": "region_c",
+      "name": "process_region_c",
+      "executor_build_id": "PROCESS_REGION_C_API",
+      "engine": "PYTHON",
+      "executor_order_id": 1,
+      "executor_sequence_id": 3,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    },
+    {
+      "id": "aggregate",
+      "name": "aggregate_results",
+      "executor_build_id": "AGGREGATE_RESULTS_API",
+      "engine": "PYTHON",
+      "executor_order_id": 2,
+      "executor_sequence_id": 1,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    }
+  ]
+}
+```
+
+> The generator detects that `aggregate` is downstream of all three layer-1 nodes and automatically applies `TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS` to it. No extra payload flag needed.
+
+---
+
+## Topology 6 — Conditional Branch: Success Path Only
+
+`validate_input` branches on HTTP status. If it succeeds (2xx), `process_data` runs. If it fails (non-2xx), no downstream task runs — DAG goes directly to `finalize_results`.
+
+> **Runtime limitation:** this passes build validation, but selecting the empty failure side makes `choose_branch` raise `AirflowException`.
+
+```
+validate_input
+    |
+    +-- 2xx  --> process_data --> finalize_results
+    |
+    +-- non-2xx --> (nothing) --> finalize_results
+```
+
+```json
+{
+  "run_control_id": "branch_success_only_demo",
+  "triggerType": "0",
+  "schedule": null,
+  "executionSteps": [
+    {
+      "id": "validate",
+      "name": "validate_input",
+      "executor_build_id": "VALIDATE_INPUT_API",
+      "engine": "PYTHON",
+      "executor_order_id": 1,
+      "executor_sequence_id": 1,
+      "execution_mode": "sync",
+      "branch_on_status": true,
+      "on_success_node_ids": ["process"],
+      "on_failure_node_ids": []
+    },
+    {
+      "id": "process",
+      "name": "process_data",
+      "executor_build_id": "PROCESS_DATA_API",
+      "engine": "PYTHON",
+      "executor_order_id": 2,
+      "executor_sequence_id": 1,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    }
+  ]
+}
+```
+
+---
+
+## Topology 7 — Conditional Branch: Failure Path Only
+
+`submit_job` branches on HTTP status. If it succeeds, no extra task runs. If it fails (non-2xx), `alert_ops` runs for failure handling.
+
+> **Runtime limitation:** this passes build validation, but selecting the empty success side makes `choose_branch` raise `AirflowException`.
+
+```
+submit_job
+    |
+    +-- 2xx  --> (nothing) --> finalize_results
+    |
+    +-- non-2xx --> alert_ops --> finalize_results
+```
+
+```json
+{
+  "run_control_id": "branch_failure_only_demo",
+  "triggerType": "0",
+  "schedule": null,
+  "executionSteps": [
+    {
+      "id": "submit",
+      "name": "submit_job",
+      "executor_build_id": "SUBMIT_JOB_API",
+      "engine": "PYTHON",
+      "executor_order_id": 1,
+      "executor_sequence_id": 1,
+      "execution_mode": "sync",
+      "branch_on_status": true,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": ["alert"]
+    },
+    {
+      "id": "alert",
+      "name": "alert_ops",
+      "executor_build_id": "ALERT_OPS_API",
+      "engine": "PYTHON",
+      "executor_order_id": 2,
+      "executor_sequence_id": 1,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    }
+  ]
+}
+```
+
+---
+
+## Topology 8 — Conditional Branch: Both Paths (Success + Failure)
+
+`check_source` routes to different tasks depending on outcome. Only one path runs.
+
+```
+check_source
+    |
+    +-- 2xx      --> transform_and_load  --> finalize_results
+    |
+    +-- non-2xx  --> quarantine_data     --> finalize_results
+```
+
+```json
+{
+  "run_control_id": "branch_both_paths_demo",
+  "triggerType": "0",
+  "schedule": null,
+  "executionSteps": [
+    {
+      "id": "check",
+      "name": "check_source",
+      "executor_build_id": "CHECK_SOURCE_API",
+      "engine": "PYTHON",
+      "executor_order_id": 1,
+      "executor_sequence_id": 1,
+      "execution_mode": "sync",
+      "branch_on_status": true,
+      "on_success_node_ids": ["transform"],
+      "on_failure_node_ids": ["quarantine"]
+    },
+    {
+      "id": "transform",
+      "name": "transform_and_load",
+      "executor_build_id": "TRANSFORM_LOAD_API",
+      "engine": "PYTHON",
+      "executor_order_id": 2,
+      "executor_sequence_id": 1,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    },
+    {
+      "id": "quarantine",
+      "name": "quarantine_data",
+      "executor_build_id": "QUARANTINE_DATA_API",
+      "engine": "PYTHON",
+      "executor_order_id": 2,
+      "executor_sequence_id": 2,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    }
+  ]
+}
+```
+
+---
+
+## Topology 9 — Conditional Branch with Parallel Success Split + Merge
+
+On success, two tasks run in parallel. On failure, one recovery task runs. All three paths converge into a single merge node.
+
+```
+validate_source
+    |
+    +-- 2xx  --> transform_customer ------+
+    |        --> enrich_customer  ---------+--> publish_result --> finalize_results
+    |
+    +-- non-2xx --> quarantine_source ----+
+```
+
+```json
+{
+  "run_control_id": "branch_parallel_split_merge_demo",
+  "triggerType": "0",
+  "schedule": null,
+  "executionSteps": [
+    {
+      "id": "validate",
+      "name": "validate_source",
+      "executor_build_id": "VALIDATE_SOURCE_API",
+      "engine": "PYTHON",
+      "executor_order_id": 1,
+      "executor_sequence_id": 1,
+      "execution_mode": "sync",
+      "branch_on_status": true,
+      "on_success_node_ids": ["transform", "enrich"],
+      "on_failure_node_ids": ["quarantine"]
+    },
+    {
+      "id": "transform",
+      "name": "transform_customer",
+      "executor_build_id": "TRANSFORM_CUSTOMER_API",
+      "engine": "PYTHON",
+      "executor_order_id": 2,
+      "executor_sequence_id": 1,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    },
+    {
+      "id": "enrich",
+      "name": "enrich_customer",
+      "executor_build_id": "ENRICH_CUSTOMER_API",
+      "engine": "PYTHON",
+      "executor_order_id": 2,
+      "executor_sequence_id": 2,
+      "execution_mode": "async_no_wait",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    },
+    {
+      "id": "quarantine",
+      "name": "quarantine_source",
+      "executor_build_id": "QUARANTINE_SOURCE_API",
+      "engine": "PYTHON",
+      "executor_order_id": 2,
+      "executor_sequence_id": 3,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    },
+    {
+      "id": "publish",
+      "name": "publish_result",
+      "executor_build_id": "PUBLISH_RESULT_API",
+      "engine": "PYTHON",
+      "executor_order_id": 3,
+      "executor_sequence_id": 1,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    }
+  ]
+}
+```
+
+> `publish_result` is referenced by no explicit `on_success_node_ids`. The generator detects it as the sole node in layer 3 and wires all layer-2 nodes to it with `TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS`.
+
+---
+
+## Topology 10 — Orphan Node
+
+`submit_audit` is in layer 1 alongside `validate_source`, but it has no downstream children and is not in the final layer. The generator auto-wires it directly to `finalize_results`.
+
+```
+run_started_event
+    |
+    +--> validate_source (order=1, seq=1, branch)
+    |         +-- success --> process_data ---------------> finalize_results
+    |         +-- failure --> quarantine_invalid_source --> finalize_results
+    |
+    +--> submit_audit (order=1, seq=99, orphan) -----------> finalize_results
+```
+
+```json
+{
+  "run_control_id": "orphan_node_demo",
+  "triggerType": "0",
+  "schedule": null,
+  "executionSteps": [
+    {
+      "id": "validate",
+      "name": "validate_source",
+      "executor_build_id": "VALIDATE_SOURCE_API",
+      "engine": "PYTHON",
+      "executor_order_id": 1,
+      "executor_sequence_id": 1,
+      "execution_mode": "sync",
+      "branch_on_status": true,
+      "on_success_node_ids": ["process"],
+      "on_failure_node_ids": ["quarantine"]
+    },
+    {
+      "id": "audit",
+      "name": "submit_audit",
+      "executor_build_id": "SUBMIT_AUDIT_API",
+      "engine": "PYTHON",
+      "executor_order_id": 1,
+      "executor_sequence_id": 99,
+      "execution_mode": "fire_and_forget",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    },
+    {
+      "id": "process",
+      "name": "process_data",
+      "executor_build_id": "PROCESS_DATA_API",
+      "engine": "PYTHON",
+      "executor_order_id": 2,
+      "executor_sequence_id": 1,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    },
+    {
+      "id": "quarantine",
+      "name": "quarantine_invalid_source",
+      "executor_build_id": "QUARANTINE_SOURCE_API",
+      "engine": "PYTHON",
+      "executor_order_id": 2,
+      "executor_sequence_id": 2,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    }
+  ]
+}
+```
+
+> `submit_audit` uses sequence `99`, while layer 2 contains multiple nodes with sequences `1` and `2`. It receives no structural downstream edge and is auto-wired to `finalize_results`. Its `fire_and_forget` mode still waits for the initial HTTP submission response.
+
+---
+
+## Topology 11 — Mixed Execution Modes
+
+Demonstrates all three execution modes in a single DAG.
+
+| Node | Mode | Behaviour |
+|---|---|---|
+| `extract_files` | `sync` | Waits for HTTP response, fails DAG on non-2xx |
+| `submit_enrichment` | `async_no_wait` | Submits job, polls status endpoint until terminal |
+| `notify_downstream` | `fire_and_forget` | Waits for initial submission only; fails on non-2xx, otherwise does not track downstream completion |
+
+```
+extract_files (sync)
+    |
+    +--> submit_enrichment (async_no_wait) --> finalize_results
+    |
+    +--> notify_downstream (fire_and_forget, orphan) --> finalize_results
+```
+
+```json
+{
+  "run_control_id": "mixed_execution_modes_demo",
+  "triggerType": "0",
+  "schedule": null,
+  "executionSteps": [
+    {
+      "id": "extract",
+      "name": "extract_files",
+      "executor_build_id": "EXTRACT_FILES_API",
+      "engine": "PYTHON",
+      "executor_order_id": 1,
+      "executor_sequence_id": 1,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    },
+    {
+      "id": "enrich",
+      "name": "submit_enrichment",
+      "executor_build_id": "SUBMIT_ENRICHMENT_API",
+      "engine": "PYTHON",
+      "executor_order_id": 2,
+      "executor_sequence_id": 1,
+      "execution_mode": "async_no_wait",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    },
+    {
+      "id": "notify",
+      "name": "notify_downstream",
+      "executor_build_id": "NOTIFY_DOWNSTREAM_API",
+      "engine": "PYTHON",
+      "executor_order_id": 2,
+      "executor_sequence_id": 2,
+      "execution_mode": "fire_and_forget",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    }
+  ]
+}
+```
+
+---
+
+## Topology 12 — Multi-Layer Real-World Pipeline
+
+A full pipeline: ingest two sources in parallel, validate, conditionally branch to either transform+load or quarantine, then publish a report.
+
+```
+run_started_event
+    |
+    +--> ingest_crm    (order=1, seq=1) ----|
+    +--> ingest_erp    (order=1, seq=2) ----|
+                                            |
+                               validate_combined (order=2, seq=1)
+                                            |
+                              branch_on_status = true
+                                            |
+                    +-- 2xx  --> transform_data (order=3, seq=1) ---|
+                    |        --> load_warehouse  (order=3, seq=2) ---|
+                    |                                                |
+                    +-- non-2xx --> quarantine   (order=3, seq=3) ---|
+                                                                     |
+                                              publish_report (order=4, seq=1)
+                                                                     |
+                                                          finalize_results
+```
+
+```json
+{
+  "run_control_id": "full_pipeline_demo",
+  "triggerType": "0",
+  "schedule": null,
+  "executionSteps": [
+    {
+      "id": "crm",
+      "name": "ingest_crm",
+      "executor_build_id": "INGEST_CRM_API",
+      "engine": "PYTHON",
+      "executor_order_id": 1,
+      "executor_sequence_id": 1,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    },
+    {
+      "id": "erp",
+      "name": "ingest_erp",
+      "executor_build_id": "INGEST_ERP_API",
+      "engine": "PYTHON",
+      "executor_order_id": 1,
+      "executor_sequence_id": 2,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    },
+    {
+      "id": "validate",
+      "name": "validate_combined",
+      "executor_build_id": "VALIDATE_COMBINED_API",
+      "engine": "PYTHON",
+      "executor_order_id": 2,
+      "executor_sequence_id": 1,
+      "execution_mode": "sync",
+      "branch_on_status": true,
+      "on_success_node_ids": ["transform", "load"],
+      "on_failure_node_ids": ["quarantine"]
+    },
+    {
+      "id": "transform",
+      "name": "transform_data",
+      "executor_build_id": "TRANSFORM_DATA_API",
+      "engine": "PYTHON",
+      "executor_order_id": 3,
+      "executor_sequence_id": 1,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    },
+    {
+      "id": "load",
+      "name": "load_warehouse",
+      "executor_build_id": "LOAD_WAREHOUSE_API",
+      "engine": "PYTHON",
+      "executor_order_id": 3,
+      "executor_sequence_id": 2,
+      "execution_mode": "async_no_wait",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    },
+    {
+      "id": "quarantine",
+      "name": "quarantine_data",
+      "executor_build_id": "QUARANTINE_DATA_API",
+      "engine": "PYTHON",
+      "executor_order_id": 3,
+      "executor_sequence_id": 3,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    },
+    {
+      "id": "publish",
+      "name": "publish_report",
+      "executor_build_id": "PUBLISH_REPORT_API",
+      "engine": "PYTHON",
+      "executor_order_id": 4,
+      "executor_sequence_id": 1,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    }
+  ]
+}
+```
+
+---
+
+## Topology 13 — Conditional Branch Inside a Parallel Layer
+
+Two nodes run in parallel in layer 1. One is a plain sync node. The other has `branch_on_status: true` and routes differently based on outcome.
+
+```
+run_started_event
+    |
+    +--> archive_data    (order=1, seq=99, sync, no branch) --> finalize_results (orphan)
+    |
+    +--> classify_record (order=1, seq=2, sync, branch)
+              |
+              +-- 2xx      --> enrich_record   (order=2, seq=1)
+              +-- non-2xx  --> flag_for_review  (order=2, seq=2)
+
+enrich_record, flag_for_review --> finalize_results
+```
+
+```json
+{
+  "run_control_id": "branch_in_parallel_layer_demo",
+  "triggerType": "0",
+  "schedule": null,
+  "executionSteps": [
+    {
+      "id": "archive",
+      "name": "archive_data",
+      "executor_build_id": "ARCHIVE_DATA_API",
+      "engine": "PYTHON",
+      "executor_order_id": 1,
+      "executor_sequence_id": 99,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    },
+    {
+      "id": "classify",
+      "name": "classify_record",
+      "executor_build_id": "CLASSIFY_RECORD_API",
+      "engine": "PYTHON",
+      "executor_order_id": 1,
+      "executor_sequence_id": 2,
+      "execution_mode": "sync",
+      "branch_on_status": true,
+      "on_success_node_ids": ["enrich"],
+      "on_failure_node_ids": ["flag"]
+    },
+    {
+      "id": "enrich",
+      "name": "enrich_record",
+      "executor_build_id": "ENRICH_RECORD_API",
+      "engine": "PYTHON",
+      "executor_order_id": 2,
+      "executor_sequence_id": 1,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    },
+    {
+      "id": "flag",
+      "name": "flag_for_review",
+      "executor_build_id": "FLAG_FOR_REVIEW_API",
+      "engine": "PYTHON",
+      "executor_order_id": 2,
+      "executor_sequence_id": 2,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    }
+  ]
+}
+```
+
+> `archive_data` has no downstream children and is not in the final layer, so the generator auto-wires it to `finalize_results` as an orphan.
+
+---
+
+## Topology 14 — Chained Branches (Branch after Branch)
+
+The first branch decides the broad path. Each branch target is itself a branch node that decides a finer-grained path. Two levels of conditional routing.
+
+```
+check_eligibility
+    |
+    +-- 2xx  --> assess_risk
+    |                |
+    |                +-- 2xx  --> approve_application
+    |                +-- non-2xx --> manual_review
+    |
+    +-- non-2xx --> reject_application
+```
+
+```json
+{
+  "run_control_id": "chained_branch_demo",
+  "triggerType": "0",
+  "schedule": null,
+  "executionSteps": [
+    {
+      "id": "eligibility",
+      "name": "check_eligibility",
+      "executor_build_id": "CHECK_ELIGIBILITY_API",
+      "engine": "PYTHON",
+      "executor_order_id": 1,
+      "executor_sequence_id": 1,
+      "execution_mode": "sync",
+      "branch_on_status": true,
+      "on_success_node_ids": ["risk"],
+      "on_failure_node_ids": ["reject"]
+    },
+    {
+      "id": "risk",
+      "name": "assess_risk",
+      "executor_build_id": "ASSESS_RISK_API",
+      "engine": "PYTHON",
+      "executor_order_id": 2,
+      "executor_sequence_id": 1,
+      "execution_mode": "sync",
+      "branch_on_status": true,
+      "on_success_node_ids": ["approve"],
+      "on_failure_node_ids": ["manual"]
+    },
+    {
+      "id": "reject",
+      "name": "reject_application",
+      "executor_build_id": "REJECT_APPLICATION_API",
+      "engine": "PYTHON",
+      "executor_order_id": 2,
+      "executor_sequence_id": 99,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    },
+    {
+      "id": "approve",
+      "name": "approve_application",
+      "executor_build_id": "APPROVE_APPLICATION_API",
+      "engine": "PYTHON",
+      "executor_order_id": 3,
+      "executor_sequence_id": 1,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    },
+    {
+      "id": "manual",
+      "name": "manual_review",
+      "executor_build_id": "MANUAL_REVIEW_API",
+      "engine": "PYTHON",
+      "executor_order_id": 3,
+      "executor_sequence_id": 2,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    }
+  ]
+}
+```
+
+> Paths that run:
+> - `check_eligibility` 2xx → `assess_risk` 2xx → `approve_application`
+> - `check_eligibility` 2xx → `assess_risk` non-2xx → `manual_review`
+> - `check_eligibility` non-2xx → `reject_application`
+
+---
+
+## Topology 15 — Conditional Branch into Three Nodes, then Merge
+
+Use this topology when one decision node must start three tasks in parallel on success, use a separate recovery task on failure, and then continue through one merge node.
+
+```
+decision
+    |
+    +-- success --> branch_a --+
+    +-- success --> branch_b --+--> merge_results --> finalize_results
+    +-- success --> branch_c --+
+    |
+    +-- failure --> handle_failure --> merge_results
+```
+
+```json
+{
+  "run_control_id": "branch_three_then_merge_demo",
+  "triggerType": "0",
+  "schedule": null,
+  "executionSteps": [
+    {
+      "id": "decision",
+      "name": "decision",
+      "executor_build_id": "DECISION_API",
+      "engine": "PYTHON",
+      "executor_order_id": 1,
+      "executor_sequence_id": 1,
+      "execution_mode": "sync",
+      "branch_on_status": true,
+      "on_success_node_ids": [
+        "branch_a",
+        "branch_b",
+        "branch_c"
+      ],
+      "on_failure_node_ids": [
+        "handle_failure"
+      ]
+    },
+    {
+      "id": "branch_a",
+      "name": "branch_a",
+      "executor_build_id": "BRANCH_A_API",
+      "engine": "PYTHON",
+      "executor_order_id": 2,
+      "executor_sequence_id": 1,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    },
+    {
+      "id": "branch_b",
+      "name": "branch_b",
+      "executor_build_id": "BRANCH_B_API",
+      "engine": "PYTHON",
+      "executor_order_id": 2,
+      "executor_sequence_id": 2,
+      "execution_mode": "async_no_wait",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    },
+    {
+      "id": "branch_c",
+      "name": "branch_c",
+      "executor_build_id": "BRANCH_C_API",
+      "engine": "PYTHON",
+      "executor_order_id": 2,
+      "executor_sequence_id": 3,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    },
+    {
+      "id": "handle_failure",
+      "name": "handle_failure",
+      "executor_build_id": "HANDLE_FAILURE_API",
+      "engine": "PYTHON",
+      "executor_order_id": 2,
+      "executor_sequence_id": 4,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    },
+    {
+      "id": "merge_results",
+      "name": "merge_results",
+      "executor_build_id": "MERGE_RESULTS_API",
+      "engine": "PYTHON",
+      "executor_order_id": 3,
+      "executor_sequence_id": 1,
+      "execution_mode": "sync",
+      "branch_on_status": false,
+      "on_success_node_ids": [],
+      "on_failure_node_ids": []
+    }
+  ]
+}
+```
+
+How it works:
+
+1. `decision` has `branch_on_status: true`.
+2. Its `on_success_node_ids` contains three node IDs, so `branch_a`, `branch_b`, and `branch_c` are selected together on success.
+3. Those three nodes share `executor_order_id: 2`, so they can run in parallel.
+4. `handle_failure` is also in layer 2, but it is selected only when `decision` fails.
+5. `merge_results` is the only node in layer 3. The generator wires all four layer-2 nodes to it and applies `TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS`.
+6. Unselected branch tasks are skipped; the merge runs after the selected route completes.
+
+> Keep `id` and `name` identical for branch targets until the current branch skip-whitelist mismatch is fixed. Also note that a failed `decision` task remains failed even when `handle_failure` succeeds, so final DAG status can still be failure.
+
+---
+
+## Full Model Schema (JSON Schema style)
+
+```json
+{
+  "BuildDagPayload": {
+    "run_control_id": { "type": "string", "minLength": 1 },
+    "triggerType":    { "type": "string", "enum": ["0","1","2","3","4","O","S","F","D","R"], "optional": true },
+    "schedule":       { "type": ["string", "null"], "optional": true },
+    "executionSteps": { "type": "array", "items": "$Node", "optional": true },
+    "nodes":          { "type": "array", "items": "$Node", "optional": true }
+  },
+
+  "Node": {
+    "id":                  { "type": "string", "optional": true, "default": "auto-assigned" },
+    "name":                { "type": "string", "minLength": 1 },
+    "executor_build_id":   { "type": "string", "minLength": 1 },
+    "engine":              { "type": "string", "minLength": 1 },
+    "executor_order_id":   { "type": "integer", "minimum": 1 },
+    "executor_sequence_id":{ "type": "integer", "minimum": 1 },
+    "execution_mode":      { "type": "string", "enum": ["sync","async_no_wait","fire_and_forget"], "default": "sync" },
+    "branch_on_status":    { "type": "boolean", "default": false },
+    "on_success_node_ids": { "type": "array", "items": "string", "default": [] },
+    "on_failure_node_ids": { "type": "array", "items": "string", "default": [] }
+  }
+}
+```
