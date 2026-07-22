@@ -1592,9 +1592,10 @@ def execute_node(
             call_label="submit",
         )
         response_body = _parse_response_body(response)
-    except AirflowException:
+    except AirflowException as exc:
         ti.xcom_push(key=f"{{node_id}}_task_state", value="failed")
         ti.xcom_push(key=f"{{node_id}}_branch", value="failure")
+        ti.xcom_push(key=f"{{node_id}}_error", value=str(exc))
         raise
     except Exception as exc:
         msg = _fmt_error("submit (network/timeout)", "N/A", str(exc),
@@ -1688,6 +1689,62 @@ def execute_node(
 
 
 # ---------------------------------------------------------------------------
+# validate_inputs — runs before any node executes.
+# Mirrors execute_node's own conf/url resolution so a bad run conf fails the
+# DAG here instead of after one or more nodes have already been submitted.
+# ---------------------------------------------------------------------------
+
+
+def validate_inputs(**kwargs):
+    ctx = get_current_context()
+    conf = _get_conf(ctx)
+
+    resume = bool(conf.get("resume"))
+    resume_from = conf.get("resume_from")
+    resume_from_order = None
+    if resume and resume_from:
+        if resume_from not in NODE_ORDER_MAP:
+            raise AirflowException(
+                f"[PREPARE_INPUTS] resume_from='{{resume_from}}' is not a valid node ID. "
+                f"Valid: {{sorted(NODE_ORDER_MAP.keys())}}"
+            )
+        resume_from_order = NODE_ORDER_MAP[resume_from]
+
+    missing = []
+    for global_seq, node_id in enumerate(FINAL_NODE_IDS, 1):
+        if (
+            resume_from_order is not None
+            and not _should_force_rerun(conf, node_id)
+            and NODE_ORDER_MAP.get(node_id, 0) < resume_from_order
+        ):
+            continue
+
+        executor_build_id = EXECUTOR_BUILD_ID_MAP.get(node_id, node_id)
+        payload = resolve_payload(
+            conf, node_id=node_id, executor_build_id=executor_build_id,
+            task_key=node_id, global_seq=global_seq,
+        )
+        payload = _normalize_request_payload(payload)
+        if not payload or not payload.get("url"):
+            missing.append((node_id, executor_build_id))
+
+    if missing:
+        details = "\\n".join(
+            f"  - node '{{node_id}}' — expected conf key: '{{executor_build_id}}'"
+            for node_id, executor_build_id in missing
+        )
+        raise AirflowException(
+            "[PREPARE_INPUTS] Run conf is missing a 'url' for one or more nodes. "
+            "Every node's conf entry must include a 'url', e.g. "
+            "{{ '<executor_build_id>': {{ 'url': 'http://...', 'json': {{...}} }} }}\\n"
+            f"{{details}}"
+        )
+
+    log.info("[PREPARE_INPUTS] All %d node(s) have a resolvable url in conf.", len(FINAL_NODE_IDS))
+    return True
+
+
+# ---------------------------------------------------------------------------
 # choose_branch
 # ---------------------------------------------------------------------------
 
@@ -1734,6 +1791,7 @@ def finalize_results(node_ids, **kwargs):
 
         marker = ti.xcom_pull(task_ids=airflow_task_id, key=f"{{node_id}}_task_state")
         marker = str(marker).lower().strip() if marker is not None else ""
+        error_detail = ti.xcom_pull(task_ids=airflow_task_id, key=f"{{node_id}}_error")
 
         entry = {{
             "task_id": airflow_task_id,
@@ -1743,6 +1801,8 @@ def finalize_results(node_ids, **kwargs):
             "state": marker or "unknown",
             "status_source": "xcom_task_state_marker",
         }}
+        if error_detail:
+            entry["error"] = error_detail
 
         if node_id in FIRE_AND_FORGET_NODE_IDS:
             entry["status_source"] = "airflow_submit_only"
@@ -1762,7 +1822,7 @@ def finalize_results(node_ids, **kwargs):
             unknown.append(entry)
 
     has_any_problem = bool(failed or unexpected_skipped or running or unknown)
-    final_status = "FAILED" if has_any_problem else "SUCCESS"
+    final_status = "Failed" if has_any_problem else "Success"
 
     summary = {{
         "final_status": final_status,
@@ -1806,6 +1866,8 @@ def run_completion(**kwargs):
         )
         final_status = "FAILED"
 
+    final_status = str(final_status).strip().upper()
+
     log.info("[COMPLETION] DAG terminal state: %s", final_status)
 
     if final_status != "SUCCESS":
@@ -1846,15 +1908,34 @@ def build_run_final_event_messages():
     status_value = ti.xcom_pull(task_ids="finalize_results", key="final_status")
     if status_value is None:
         log.warning("[KAFKA] final_status XCom missing — defaulting to FAILED.")
-        status_value = "FAILED"
+        is_success = False
+    else:
+        is_success = str(status_value).strip().upper() == "SUCCESS"
     # Map internal uppercase states to the agreed Kafka event status values
-    kafka_status = "Success" if status_value == "SUCCESS" else "Failure"
+    kafka_status = "Success" if is_success else "Failure"
+
+    final_summary = ti.xcom_pull(task_ids="finalize_results", key="final_summary") or {{}}
+    failed_nodes = [
+        {{
+            "node_id": entry.get("node_id"),
+            "executor_build_id": entry.get("executor_build_id"),
+            "state": entry.get("state"),
+            "error": entry.get("error"),
+        }}
+        for entry in (
+            final_summary.get("failed_tasks", [])
+            + final_summary.get("unexpected_skipped_tasks", [])
+            + final_summary.get("unknown_tasks", [])
+        )
+    ]
+
     payload = {{
-        "eventType": {repr(EVENTS["run_succeeded"])} if status_value == "SUCCESS" else {repr(EVENTS["run_failed"])},
+        "eventType": {repr(EVENTS["run_succeeded"])} if is_success else {repr(EVENTS["run_failed"])},
         "run_control_id": RUN_CONTROL_ID,
         "correlation_id": _get_correlation_id(ctx),
         "event_source": "AIRFLOW",
         "status": kafka_status,
+        "failed_nodes": failed_nodes,
         "trigger_payload": _safe_json(_get_conf(ctx)),
         "dagId": ctx["dag"].dag_id,
         "dagRunId": dag_run.run_id,
@@ -1874,14 +1955,15 @@ with DAG(
     catchup=False,
     max_active_runs=1,
     render_template_as_native_obj=True,
+    is_paused_upon_creation=False,
     tags=["dynamic", "generated", "v1.3", "airflow-3.0.6"],
     doc_md=f"Dynamic DAG — run_control_id: {repr(run_control_id)} | nodes: {repr(len(all_nodes))}",
 ) as dag:
 
     prepare_inputs_task = PythonOperator(
         task_id="prepare_inputs",
-        python_callable=lambda: True,
-        doc_md="Entry sentinel — initializes DAG context before Kafka event.",
+        python_callable=validate_inputs,
+        doc_md="Validates every node has a resolvable 'url' in run conf before any node executes.",
     )
 
     run_started_event = ProduceToTopicOperator(
@@ -1967,13 +2049,13 @@ def build_dag(payload: BuildDagPayload) -> Dict[str, Any]:
     dag_file_name = f"{dag_id}.py"
     dag_file_path = DAGS_FOLDER / dag_file_name
 
-    # Remove any stale timestamped files for this dag_id left from previous service versions
-    for stale in DAGS_FOLDER.glob(f"{dag_id}_2*.py"):
-        try:
-            stale.unlink()
-            logger.info("Removed stale timestamped DAG file: %s", stale.name)
-        except Exception as exc:
-            logger.warning("Could not remove stale DAG file %s: %s", stale.name, exc)
+    # # Remove any stale timestamped files for this dag_id left from previous service versions
+    # for stale in DAGS_FOLDER.glob(f"{dag_id}_2*.py"):
+    #     try:
+    #         stale.unlink()
+    #         logger.info("Removed stale timestamped DAG file: %s", stale.name)
+    #     except Exception as exc:
+    #         logger.warning("Could not remove stale DAG file %s: %s", stale.name, exc)
 
     # FIX C: cycle detection — runs after all structural validations pass
     try:
@@ -2002,7 +2084,6 @@ def build_dag(payload: BuildDagPayload) -> Dict[str, Any]:
         "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "payload_hash": idempotency_key,
-        "code_generation_version": CODE_GENERATION_VERSION,
         "node_count": len(payload.nodes),
         "airflow_version": "3.0.6",
     }
